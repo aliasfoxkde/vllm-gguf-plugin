@@ -176,6 +176,11 @@ class GGUFLinearMethod(LinearMethodBase):
         weight = layer.weight
         shard_id_map = weight.shard_id_map
         shard_id = weight.shard_id
+        target_device = (
+            weight.device
+            if weight.device.type == "cuda"
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
         if len(data_container := weight.data_container) > 1:
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
@@ -185,19 +190,29 @@ class GGUFLinearMethod(LinearMethodBase):
             padded_side = max(x.size(1) for x in data_container)
             concat_side = sum(x.size(0) for x in data_container)
             padded_data = torch.zeros(
-                (concat_side, padded_side), dtype=dtype, device=weight.device
+                (concat_side, padded_side), dtype=dtype, device=target_device
             )
             shard_offset_map = dict[str, tuple[int, int, int]]()
             ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
             current_offset = 0
+            use_non_blocking = target_device.type == "cuda"
             for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
                 start = current_offset
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
+                padded_data[start:end, :size].copy_(
+                    data_container[id_in_container], non_blocking=use_non_blocking
+                )
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
+            # Shards are CPU staging tensors (possibly pinned). A pinned source
+            # must outlive its async H2D copy — synchronize BEFORE dropping the
+            # container references; never free inside the copy loop.
+            if use_non_blocking:
+                torch.cuda.synchronize()
+            for i in range(len(data_container)):
+                data_container[i] = None
             padded_param = GGUFWeightParameter(
                 data=padded_data,
                 weight_loader=weight.weight_loader,
@@ -217,6 +232,10 @@ class GGUFLinearMethod(LinearMethodBase):
             if weight.data.numel() > 0:
                 weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
             layer.register_parameter("weight", padded_param)
+        elif len(data_container) == 1:
+            # Single shard: move CPU staging tensor to target device.
+            weight.data = data_container[0].to(target_device)
+            data_container.clear()
 
     def apply(
         self,
