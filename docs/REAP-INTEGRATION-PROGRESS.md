@@ -6,7 +6,7 @@ working with vLLM via this plugin.
 
 ## Status: Core config loading works, VllmConfig validation is the blocker
 
-### What works
+### What works (as of commit 35d87b0)
 
 1. **GGUFConfigParser** reads REAP GGUF metadata directly via `load_gguf_checkpoint`
    (bypassing parent-dir config.json). Returns correct config:
@@ -95,15 +95,27 @@ Layer 40: Full attention + MTP head (blk.40.nextn.*)
 
 ### Next steps
 
-1. **Debug VllmConfig validator**: Add debug prints to `VllmConfig.__init__`
-   to identify which field's validator is failing
-2. **Check if SpeculativeConfig is auto-created** even without `--spec-method`:
-   `create_speculative_config()` may auto-create a config when `target_model_config`
-   has MTP-related attributes
-3. **Try with explicit `--hf-config-path` pointing to a real HF model dir**:
-   `vllm serve <gguf> --hf-config-path ~/.cache/huggingface/modules/...`
-4. **Check `VLLM_MODEL_REDIRECT_PATH`**: Could redirect the GGUF path to a real
-   HF model directory containing only config.json
+1. **Debug VllmConfig validator**: The `VllmConfig.__init__` at
+   `arg_utils.py:2372` is the call site. Add debug prints inside
+   `VllmConfig.__init__` to identify which field/validator fails.
+   Suspect: a field validator or `model_validator` accesses `model_config.model`
+   and tries to load it via HF Hub.
+2. **Check `create_speculative_config`**: Even without `--spec-method`, vLLM may
+   auto-create a speculative config for models with MTP heads, which then tries
+   to load the draft model config from `model_config.model`.
+3. **Check `hf_config_path` redirect**: The redirect to `Qwen/Qwen3.6-35B-A3B`
+   works for the first ModelConfig creation but `create_engine_config` calls
+   `create_model_config` again (second time with the HF redirect path). The
+   second call may not be going through GGUFConfigParser.
+4. **Critical issue found**: `intermediate_size: 0` in the REAP GGUF — the
+   GGUF has `qwen35moe.feed_forward_length` MISSING. The correct value is
+   `expert_feed_forward_length=512`. Must fix `map_qwen35_config()` to use
+   `expert_feed_forward_length` when `feed_forward_length` is 0/absent.
+5. **Use `VLLM_MODEL_REDIRECT_PATH`**: Create a redirect file mapping the
+   GGUF path to a real HF model directory. This would bypass all the
+   `model` vs `hf_config_path` confusion entirely.
+6. **Pre-download HF config**: `vllm serve <gguf> --hf-config-path ~/.cache/huggingface/...`
+   with the Qwen3.6-35B-A3B config already cached locally.
 
 ### DSpark integration (future work)
 

@@ -66,7 +66,11 @@ def map_qwen35_config(arch: str, meta: dict) -> PretrainedConfig:
     num_hidden_layers = block_count - nextn  # critical: MTP layer is not a model layer
 
     hidden_size = _safe_int(meta, f"{prefix}embedding_length")
+    # MoE models may not have feed_forward_length; use expert_feed_forward_length.
+    # For dense models feed_forward_length is always present.
     intermediate_size = _safe_int(meta, f"{prefix}feed_forward_length")
+    if intermediate_size == 0 and arch == "qwen35moe":
+        intermediate_size = _safe_int(meta, f"{prefix}expert_feed_forward_length")
     max_position_embeddings = _safe_int(meta, f"{prefix}context_length")
 
     num_attention_heads = _safe_int(meta, f"{prefix}attention.head_count")
