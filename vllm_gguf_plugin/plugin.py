@@ -74,6 +74,22 @@ def _patch_engine_args() -> None:
                 self.tokenizer if isinstance(self.tokenizer, str) else None,
                 self.hf_config_path,
             )
+            # hf_config_path must point to the GGUF file (not its parent dir)
+            # so GGUFConfigParser can parse it directly via load_gguf_checkpoint.
+            # ModelConfig uses hf_config_path or model (whichever is set) to load
+            # the config - keeping model=gguf_path is fine with config_format=gguf.
+            if self.hf_config_path is None:
+                self.hf_config_path = gguf_model
+            # For standalone GGUF files (no config.json sibling), keep model pointing
+            # at the GGUF file so get_config parses it via GGUFConfigParser directly.
+            if self.model == gguf_model or self.model != self.hf_config_path:
+                self.model = gguf_model
+            # Redirect hf_config_path to the Qwen3.6 base HF repo so
+            # get_hf_image_processor_config (which calls HF Hub) doesn't
+            # try to validate the .gguf path as a repo ID. GGUFConfigParser
+            # handles the actual config reading from the GGUF file directly.
+            if self.hf_config_path == gguf_model:
+                self.hf_config_path = "Qwen/Qwen3.6-35B-A3B"
         return original_create_model_config(self, *args, **kwargs)
 
     EngineArgs.create_model_config = create_model_config
@@ -107,6 +123,66 @@ def _register_omni_diffusion_quantization() -> None:
     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
 
 
+def _patch_hf_image_processor() -> None:
+    """Patch get_hf_image_processor_config for GGUF files.
+
+    Three layers need patching because vLLM and transformers do `from ... import`
+    at module load time, capturing local references:
+    1. `vllm.transformers_utils.config.get_hf_image_processor_config` — top-level
+    2. `vllm.config.model.get_hf_image_processor_config` — direct import in model.py
+    3. `transformers.models.auto.image_processing_auto.get_image_processor_config`
+       — called by vllm's wrapper
+
+    Each patch returns {} for GGUF files, bypassing HF Hub image-processor lookup.
+    """
+    from .gguf_utils import check_gguf_file as _check_gguf
+    _empty = {}
+
+    def _make_patcher(name, orig_fn):
+        # Don't re-patch an already-patched function
+        if getattr(orig_fn, "_gguf_patched", False):
+            return orig_fn
+
+        def _patched(model, **kwargs):
+            if _check_gguf(model):
+                return _empty
+            return orig_fn(model, **kwargs)
+
+        _patched._gguf_patched = True  # type: ignore[attr-defined]
+        return _patched
+
+    # Layer 1: vllm.transformers_utils.config
+    try:
+        import vllm.transformers_utils.config as tu_config
+        tu_config.get_hf_image_processor_config = _make_patcher(
+            "vllm.transformers_utils.config",
+            tu_config.get_hf_image_processor_config,
+        )
+    except Exception:
+        pass
+
+    # Layer 2: vllm.config.model
+    try:
+        from vllm.config import model as model_module
+        if not getattr(model_module.get_hf_image_processor_config, "_gguf_patched", False):
+            model_module.get_hf_image_processor_config = _make_patcher(
+                "vllm.config.model",
+                model_module.get_hf_image_processor_config,
+            )
+    except Exception:
+        pass
+
+    # Layer 3: transformers.models.auto.image_processing_auto
+    try:
+        import transformers.models.auto.image_processing_auto as ip_auto
+        ip_auto.get_image_processor_config = _make_patcher(
+            "transformers.auto",
+            ip_auto.get_image_processor_config,
+        )
+    except Exception:
+        pass
+
+
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
     register_quantization_config("gguf")(GGUFConfig)
@@ -125,6 +201,7 @@ def register() -> None:
         register_config_parser("gguf")(GGUFConfigParser)
     _patch_engine_args()
     _patch_speculator_probe()
+    _patch_hf_image_processor()
     _patch_diffusers_loader()
     _register_qwen35_gguf()
     from .mtp_enable import install as _install_mtp

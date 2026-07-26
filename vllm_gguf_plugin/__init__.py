@@ -13,6 +13,12 @@ try:
 except ImportError:
     pass
 
+# Must patch before any vLLM module is imported.
+# This is why it's here in __init__.py rather than in register().
+from .plugin import _patch_hf_image_processor
+
+_patch_hf_image_processor()
+
 from .config_parser import GGUFConfigParser  # noqa: E402
 from .loader import GGUFModelLoader
 from .plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
