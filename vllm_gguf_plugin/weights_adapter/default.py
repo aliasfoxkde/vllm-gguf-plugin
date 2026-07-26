@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 _QWEN35_ARCH_MAP: dict[str, gguf.MODEL_ARCH] = {
     "qwen3_5_text": gguf.MODEL_ARCH.QWEN35,
     "qwen3_5_moe_text": gguf.MODEL_ARCH.QWEN35MOE,
+    "qwen3_5_moe": gguf.MODEL_ARCH.QWEN35MOE,
 }
 
 # ── GDN layout fixup helpers (undo llama.cpp transforms at load) ───────
@@ -310,7 +311,7 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         if is_multimodal:
             mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
             vision_name_map = gguf.get_tensor_name_map(
-                mm_proj_arch, config.vision_config.num_hidden_layers
+                mm_proj_arch, getattr(config.vision_config, 'num_hidden_layers', 0)
             )
         else:
             vision_name_map = None

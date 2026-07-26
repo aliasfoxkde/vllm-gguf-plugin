@@ -134,6 +134,14 @@ def map_qwen35_config(arch: str, meta: dict) -> PretrainedConfig:
     # a Qwen3_5MTP draft from the baked blk.<num_hidden_layers>.nextn.* head.
     config.mtp_num_hidden_layers = nextn
     config.num_nextn_predict_layers = nextn
+    # For MoE models, vocab_size lives in text_config, ensure it's set there too
+    if arch == "qwen35moe":
+        text_cfg = config.get_text_config()
+        if not hasattr(text_cfg, 'vocab_size') or text_cfg.vocab_size != vocab_size:
+            text_cfg.vocab_size = vocab_size
+    # Ensure vocab_size is accessible at top level for model loading
+    if not hasattr(config, 'vocab_size'):
+        config.vocab_size = vocab_size
     return config
 
 
