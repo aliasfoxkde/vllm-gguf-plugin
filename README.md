@@ -7,13 +7,17 @@ extended to serve **Qwen3.5 / Qwen3.6 hybrid (GatedDeltaNet + full-attention)
 GGUFs — dense and MoE — at ik_llama.cpp-class speeds, including the baked MTP
 (nextn) head as vLLM speculative decoding.**
 
+**Maintained at [aliasfoxkde/vllm-gguf-plugin](https://github.com/aliasfoxkde/vllm-gguf-plugin).**
+
 ## Validated models
 
 ### Qwen3.6 hybrid (localweights)
 - `Qwen3.6-27B-MTP-IMAT-IQ4_XS-Q8nextn` — dense, 64 layers = 48 GDN + 16 full-attn
   [[model card](https://huggingface.co/localweights/Qwen3.6-27B-MTP-IMAT-IQ4_XS-Q8nextn-GGUF)]
+  (original Qwen3.6 hybrid from localweights)
 - `Qwen3.6-35B-A3B-MTP-IMAT-IQ4_XS-Q8nextn` — MoE, 256 experts
   [[model card](https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IMAT-IQ4_XS-Q8nextn-GGUF)]
+  (original Qwen3.6 MoE hybrid from localweights)
 
 ### Qwen3.6 REAP (JZC973)
 - **Qwen3.6-35B-A3B-REAP** — MoE with REAP (Rotary Embedding Alignment with
@@ -162,4 +166,5 @@ pytest tests/test_kernels.py   # single file
 ## Repository
 
 Forked from [vllm-project/vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin).
-Maintained at [aliasfoxkde/vllm-gguf-plugin](https://github.com/aliasfoxkde/vllm-gguf-plugin).
+Maintained at [aliasfoxkde/vllm-gguf-plugin](https://github.com/aliasfoxkde/vllm-gguf-plugin)
+(PRs/issues welcome).
