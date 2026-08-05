@@ -1,126 +1,124 @@
-# Qwen3.6 REAP Integration Progress
+# Qwen3.6 REAP + TurboQuant Integration Progress
 
 ## Goal
-Get `JZC973/Qwen3.6-35B-REAP-MTP-UD-GGUF-Collection/Qwen3.6-35B-A3B-UD-Q3_K_XL-REAP.gguf`
-working with vLLM via this plugin.
+Get `JZC973/Qwen3.6-35B-REAP-MTP-UD-GGUF-Collection` working with vLLM via this plugin, with TurboQuant KV cache compression and DSpark speculative decoding.
 
-## Status: Core config loading works, VllmConfig validation is the blocker
+## Status (Aug 4, 2026): Config loading works, model loading OOM on 16GB GPU
 
-### What works (as of commit 35d87b0)
+### What works
 
 1. **GGUFConfigParser** reads REAP GGUF metadata directly via `load_gguf_checkpoint`
-   (bypassing parent-dir config.json). Returns correct config:
-   - `model_type: qwen3_5_moe_text`
-   - `num_hidden_layers: 40` (block_count=41, nextn=1)
-   - `num_experts: 192`, `num_experts_per_tok: 8`
-   - `vocab_size: 248320`
-   - `architectures: ['Qwen3_5MoeForCausalLM']`
-   - `mtp_num_hidden_layers: 1`
+   - Correctly identifies `Qwen3_5MoeForCausalLM` architecture
+   - Returns correct `num_hidden_layers: 40` (block_count=41, nextn=1)
+   - `num_experts: 180` (RangerX), `num_experts_per_tok: 8`
 
-2. **Plugin registration** works: `vllm_gguf_plugin.register()` is called
-   via `vllm.general_plugins` entry point. GGUF loader, quant config,
-   and MTP speculative decoding all register OK.
+2. **VllmConfig validation errors FIXED** (commit dd66a4d):
+   - `_patch_get_quant_config()` bypasses HF Hub downloads for GGUF files
+   - `try_get_local_file` patched for sentence-transformer config lookup
+   - Returns proper `GGUFConfig()` instead of None
 
-3. **Model registration** works: `Qwen3_5MoeForCausalLM` is registered in
-   `vllm.ModelRegistry`.
+3. **TurboQuant+ integration** (commit dd66a4d):
+   - `turboquant_integration.py` module added
+   - Enabled via `VLLM_GGUF_TURBOQUANT=1` env var
+   - KV: K=4, V=4 bits via WHT rotation + Lloyd-Max
+   - Weight: kurtosis-aware 3-bit compression for MoE
+   - Expert pruning support (REAP-style)
 
 ### What's broken
 
-`VllmConfig(...)` construction (called by `create_engine_config`) raises:
-```
-ValueError: Repo id must be in the form 'repo_name' or 'namespace/repo_name':
-/home/mkinney/Models/JZC973/Qwen3.6-35B-REAP-MTP-UD-GGUF-Collection/
-Qwen3.6-35B-A3B-UD-Q3_K_XL-REAP.gguf
-```
+**OOM during model initialization** on RTX 5060 Ti 16GB:
+- Model file: `Qwen3.6-35B-A3B-UD-IQ3_XXS-REAP-RangerX.gguf` (~10.5GB on disk)
+- vLLM allocates ~22GB RSS during model init (OOM-killed by kernel)
+- Happens at "Enabled custom fusions: norm_quant, act_quant" step
+- Even with `--enforce-eager`, `--gpu-memory-utilization 0.1`, `--max-model-len 128`
+- CUDA graphs capture not involved (disabled in eager mode)
 
-This happens **after** `ModelConfig` is created successfully. The error
-originates from a Pydantic validator inside `VllmConfig.__init__`, NOT from
-`get_hf_image_processor_config`. All three image-processor patches are working
-correctly (verified with debug output showing `is_gguf=True` and `returning empty`).
+**Root cause**: vLLM's model initialization overhead exceeds available VRAM even for a quantized model.
 
-### Root cause investigation
+### Research findings
 
-- `model_config.model` = GGUF file path
-- `model_config.hf_config_path` = `Qwen/Qwen3.6-35B-A3B` (redirected)
-- `VllmConfig.__init__` calls pydantic validators after all fields are set
-- No `get_hf_image_processor_config` calls appear in debug output after
-  the ModelConfig succeeds (first call, then second call in create_engine_config)
-- The error is not from `SpeculativeConfig` (no speculative config passed)
-- The error is NOT from `get_hf_image_processor_config` — it appears the patch is working
+1. **TurboQuant+ (varjoranta/turboquant-vllm)**:
+   - Explicitly supports Qwen3.6-35B-A3B MoE + partial rotary
+   - Supports MoE weight compression with kurtosis-aware bit allocation
+   - KV compression via WHT rotation + Lloyd-Max quantization
+   - Compatible with vLLM 0.19-0.20 and 0.25.x
 
-### Attempted fixes
+2. **DSpark speculative decoding**:
+   - Method: `dspark` in `SpeculativeConfig`
+   - Automatically detected if "dspark" in draft model name
+   - Draft model: `ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF` (~1.5GB)
+   - Compatible with Qwen3 model family
+   - Supports heterogeneous vocab
 
-1. **Set `hf_config_path = "Qwen/Qwen3.6-35B-A3B"`** (base HF repo) to redirect
-   image-processor lookup away from the .gguf file. This changes the error
-   path but the same ValueError persists from within `VllmConfig.__init__`.
-   The actual repo ID being validated is the HF redirect, not the GGUF file.
+3. **DFlash + KV quantization incompatibility**:
+   - DFlash requires `causal=False` but turboquant backend hardcodes `causal=True`
+   - Issue: https://github.com/vllm-project/vllm/issues/41559
+   - DSpark likely doesn't have this issue (not confirmed)
 
-2. **Patched `get_hf_image_processor_config` at 3 layers**: this works
-   (confirmed with debug) but doesn't solve the underlying VllmConfig error.
+4. **TurboQuant 4-bit variants**:
+   - `turboquant_4bit_nc` = 3.4x KV cache reduction, modest accuracy loss
+   - `turboquant_k8v4` = 2.4x reduction, minimal advantage over FP8
+   - Avoid `k3v4-nc` and `3bit-nc` (up to 20 accuracy points drop)
 
-3. **`hf_config_path` redirect in `_patch_engine_args()`**: sets
-   `hf_config_path = "Qwen/Qwen3.6-35B-A3B"` so image processor lookup goes
-   to the real HF repo. But `ModelConfig.__post_init__` still uses `self.model`
-   (the GGUF path) for other lookups.
+### Model specs
 
-### Key code locations
-
-- `vllm_gguf_plugin/plugin.py:52` — `_patch_engine_args()`: sets `hf_config_path`
-  to base HF repo for GGUF files
-- `vllm_gguf_plugin/config_parser.py:53` — `GGUFConfigParser._parse_gguf_file()`:
-  reads GGUF directly via `load_gguf_checkpoint`, sets architectures
-- `vllm_gguf_plugin/qwen35_config.py:50` — `map_qwen35_config()`: pure function
-  that builds Qwen3_5MoeTextConfig from GGUF metadata
-- `vllm_gguf_plugin/plugin.py:120` — `_patch_hf_image_processor()`: patches
-  image processor config to return `{}` for GGUF files (3 layers)
-
-### Model specs (REAP GGUF)
-
-```
-Architecture: qwen35moe
-block_count: 41 (40 layers + 1 MTP)
-nextn_predict_layers: 1
-num_experts: 192 (ATBender) / 180 (RangerX)
-num_experts_per_tok: 8
-hidden_size: 2048
-intermediate_size: 0 (needs expert_feed_forward_length=512 from GGUF)
-head_dim: 256
-num_attention_heads: 16
-num_key_value_heads: 2
-Tensor types: Q6_K(4), F32(368), Q8_0(259), IQ4_XS(39), IQ3_XXS(78), Q4_K(1), Q3_K(2), BF16(2)
-```
-
-Layers 0–39: GDN (ssm_a, ssm_alpha, etc.)
-Layer 40: Full attention + MTP head (blk.40.nextn.*)
+| Model | Size | Experts | Quantization |
+|-------|------|---------|-------------|
+| Qwen3.6-35B-A3B-UD-IQ3_XXS-REAP | ~10.5GB | 192 (ATBender) | IQ3_XXS |
+| Qwen3.6-35B-A3B-UD-IQ3_XXS-REAP-RangerX | ~10.5GB | 180 (RangerX) | IQ3_XXS |
+| Qwen3.6-35B-A3B-UD-Q3_K_XL-REAP | ~13.4GB | 192 (ATBender) | Q3_K_XL |
+| ankk98/dspark-qwen3-8b-block7-Q4_K_M | ~1.5GB | N/A | Q4_K_M |
 
 ### Next steps
 
-1. **Debug VllmConfig validator**: The `VllmConfig.__init__` at
-   `arg_utils.py:2372` is the call site. Add debug prints inside
-   `VllmConfig.__init__` to identify which field/validator fails.
-   Suspect: a field validator or `model_validator` accesses `model_config.model`
-   and tries to load it via HF Hub.
-2. **Check `create_speculative_config`**: Even without `--spec-method`, vLLM may
-   auto-create a speculative config for models with MTP heads, which then tries
-   to load the draft model config from `model_config.model`.
-3. **Check `hf_config_path` redirect**: The redirect to `Qwen/Qwen3.6-35B-A3B`
-   works for the first ModelConfig creation but `create_engine_config` calls
-   `create_model_config` again (second time with the HF redirect path). The
-   second call may not be going through GGUFConfigParser.
-4. **Critical issue found**: `intermediate_size: 0` in the REAP GGUF — the
-   GGUF has `qwen35moe.feed_forward_length` MISSING. The correct value is
-   `expert_feed_forward_length=512`. Must fix `map_qwen35_config()` to use
-   `expert_feed_forward_length` when `feed_forward_length` is 0/absent.
-5. **Use `VLLM_MODEL_REDIRECT_PATH`**: Create a redirect file mapping the
-   GGUF path to a real HF model directory. This would bypass all the
-   `model` vs `hf_config_path` confusion entirely.
-6. **Pre-download HF config**: `vllm serve <gguf> --hf-config-path ~/.cache/huggingface/...`
-   with the Qwen3.6-35B-A3B config already cached locally.
+1. **Test on larger GPU** (RTX 3090 Ti 24GB or better) - current blocker is VRAM
+2. **Verify TurboQuant integration** once model loads successfully
+3. **Add DSpark draft model support** for speculative decoding
+4. **Benchmark**: MTP vs DSpark at concurrency [2,4,8,12,14,16,18,20,24]
 
-### DSpark integration (future work)
+### Architecture notes
 
-- DSpark GGUF: `ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF`
-- DSpark = speculative decoding using a separate draft model
-- vLLM supports `dspark` method in `SpeculativeConfig`
-- Would need to implement GGUF tensor mapping for the draft model architecture
-- Benchmark plan: concurrency [2,4,8,12,14,16,18,20,24] for MTP vs DSpark vs llama.cpp
+```
+vLLM GGUF Plugin
+├── GGUFConfigParser → reads GGUF metadata directly
+├── TurboQuant+ (optional)
+│   ├── KV: WHT rotation + Lloyd-Max (K=4, V=4)
+│   └── Weight: kurtosis-aware 3-bit MoE compression
+├── MTP speculative decoding (baked nextn head)
+└── DSpark (future: separate draft model GGUF)
+```
+
+## TurboQuant Usage
+
+```bash
+# Install TurboQuant+
+pip install turboquant-plus-vllm
+
+# Enable with KV + weight compression
+VLLM_GGUF_TURBOQUANT=1 vllm serve <model.gguf> \
+    --kv-cache-dtype turboquant_4bit_nc \
+    --attention-backend CUSTOM
+
+# KV-only (aggressive compression)
+VLLM_GGUF_TURBOQUANT=1 vllm serve <model.gguf> \
+    --kv-cache-dtype turboquant_4bit_nc \
+    --attention-backend CUSTOM
+
+# With MoE expert pruning (REAP-style 50% pruning)
+VLLM_GGUF_TURBOQUANT=1 \
+    VLLM_GGUF_TURBOQUANT_PRUNE_EXPERTS=0.5 \
+    vllm serve <model.gguf> \
+    --kv-cache-dtype turboquant_4bit_nc
+```
+
+## DSpark Usage
+
+```bash
+# DSpark requires separate draft model GGUF
+vllm serve <target.gguf> \
+    --speculative-config '{
+        "method": "dspark",
+        "model": "/path/to/dspark-qwen3-8b-block7-Q4_K_M.gguf",
+        "num_speculative_tokens": 7
+    }'
+```
