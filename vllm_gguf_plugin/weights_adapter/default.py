@@ -34,6 +34,8 @@ _QWEN35_ARCH_MAP: dict[str, gguf.MODEL_ARCH] = {
     "qwen3_5_text": gguf.MODEL_ARCH.QWEN35,
     "qwen3_5_moe_text": gguf.MODEL_ARCH.QWEN35MOE,
     "qwen3_5_moe": gguf.MODEL_ARCH.QWEN35MOE,
+    "qwen3_5": gguf.MODEL_ARCH.QWEN35,  # Qwen/Qwen3.5-4B base model
+    "qwen3": gguf.MODEL_ARCH.QWEN35,  # Qwen3 base model (fallback)
 }
 
 # ── GDN layout fixup helpers (undo llama.cpp transforms at load) ───────

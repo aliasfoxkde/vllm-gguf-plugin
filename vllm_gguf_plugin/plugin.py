@@ -84,16 +84,40 @@ def _patch_engine_args() -> None:
             # at the GGUF file so get_config parses it via GGUFConfigParser directly.
             if self.model == gguf_model or self.model != self.hf_config_path:
                 self.model = gguf_model
-            # Redirect hf_config_path to the Qwen3.6 base HF repo so
-            # get_hf_image_processor_config (which calls HF Hub) doesn't
-            # try to validate the .gguf path as a repo ID. GGUFConfigParser
-            # handles the actual config reading from the GGUF file directly.
-            if self.hf_config_path == gguf_model:
-                self.hf_config_path = "Qwen/Qwen3.6-35B-A3B"
+            # Don't redirect hf_config_path - keep it pointing to the GGUF file.
+            # The GGUFConfigParser handles config reading from GGUF metadata.
+            # Image processor config will be empty for text-only GGUF models.
         return original_create_model_config(self, *args, **kwargs)
 
     EngineArgs.create_model_config = create_model_config
     EngineArgs._gguf_create_model_config_patched = True
+
+
+def _patch_get_quant_config() -> None:
+    """Patch get_quant_config to bypass HF Hub downloads for GGUF files.
+
+    GGUF quantization config is in the GGUF metadata, not in separate JSON
+    files on HF Hub. Without this patch, get_quant_config calls
+    hf_api().snapshot_download which fails on .gguf file paths.
+    """
+    if getattr(_patch_get_quant_config, "_patched", False):
+        return
+
+    from .gguf_utils import check_gguf_file as _check_gguf
+    from .quantization.config import GGUFConfig
+
+    import vllm.model_executor.model_loader.weight_utils as weight_utils
+    original_get_quant_config = weight_utils.get_quant_config
+
+    def _patched_get_quant_config(model_config, load_config):
+        if _check_gguf(model_config.model):
+            # GGUF files carry quantization config in metadata; no HF Hub download needed.
+            # Return a GGUFConfig instance so the downstream quantization checks succeed.
+            return GGUFConfig()
+        return original_get_quant_config(model_config, load_config)
+
+    weight_utils.get_quant_config = _patched_get_quant_config
+    _patch_get_quant_config._patched = True  # type: ignore[attr-defined]
 
 
 def _patch_speculator_probe() -> None:
@@ -124,16 +148,18 @@ def _register_omni_diffusion_quantization() -> None:
 
 
 def _patch_hf_image_processor() -> None:
-    """Patch get_hf_image_processor_config for GGUF files.
+    """Patch HF-related functions for GGUF files.
 
-    Three layers need patching because vLLM and transformers do `from ... import`
+    Four layers need patching because vLLM and transformers do `from ... import`
     at module load time, capturing local references:
     1. `vllm.transformers_utils.config.get_hf_image_processor_config` — top-level
     2. `vllm.config.model.get_hf_image_processor_config` — direct import in model.py
     3. `transformers.models.auto.image_processing_auto.get_image_processor_config`
        — called by vllm's wrapper
+    4. `vllm.transformers_utils.repo_utils.try_get_local_file` — called from
+       get_sentence_transformer_tokenizer_config; bypasses HF validation for GGUF
 
-    Each patch returns {} for GGUF files, bypassing HF Hub image-processor lookup.
+    Each patch returns {} or None for GGUF files, bypassing HF Hub lookups.
     """
     from .gguf_utils import check_gguf_file as _check_gguf
     _empty = {}
@@ -182,6 +208,66 @@ def _patch_hf_image_processor() -> None:
     except Exception:
         pass
 
+    # Layer 4: try_get_local_file — called from get_sentence_transformer_tokenizer_config
+    # For GGUF files, return None immediately (sentence-transformer configs don't apply).
+    # The function is imported directly into vllm.transformers_utils.config, so we must
+    # patch the reference there (not just in repo_utils).
+    try:
+        import vllm.transformers_utils.repo_utils as repo_utils
+        if not getattr(repo_utils.try_get_local_file, "_gguf_patched", False):
+            _orig_try_get_local_file = repo_utils.try_get_local_file
+
+            def _patched_try_get_local_file(model, file_name, revision=None):
+                if _check_gguf(model):
+                    return None
+                return _orig_try_get_local_file(model, file_name, revision)
+
+            _patched_try_get_local_file._gguf_patched = True  # type: ignore[attr-defined]
+            repo_utils.try_get_local_file = _patched_try_get_local_file
+
+        # Also patch the direct import in transformers_utils.config
+        import vllm.transformers_utils.config as tu_config
+        if not getattr(tu_config.try_get_local_file, "_gguf_patched", False):
+            tu_config.try_get_local_file = repo_utils.try_get_local_file
+    except Exception:
+        pass
+
+
+def _install_turboquant() -> None:
+    """Install TurboQuant+ KV cache and/or weight compression if requested via env vars.
+
+    Enabled by setting VLLM_GGUF_TURBOQUANT=1 and optionally:
+    - VLLM_GGUF_TURBOQUANT_KV_K_BITS: Key bits (default 4)
+    - VLLM_GGUF_TURBOQUANT_KV_V_BITS: Value bits (default 4)
+    - VLLM_GGUF_TURBOQUANT_WEIGHT_BITS: Weight bits (default 3)
+    - VLLM_GGUF_TURBOQUANT_PRUNE_EXPERTS: MoE expert pruning fraction (default 0)
+    """
+    import os as _os
+
+    if not _os.environ.get("VLLM_GGUF_TURBOQUANT", "").strip():
+        return
+
+    try:
+        from .turboquant_integration import install_turboquant
+    except ImportError:
+        return
+
+    kv_k = int(_os.environ.get("VLLM_GGUF_TURBOQUANT_KV_K_BITS", "4"))
+    kv_v = int(_os.environ.get("VLLM_GGUF_TURBOQUANT_KV_V_BITS", "4"))
+    weight_bits = int(_os.environ.get("VLLM_GGUF_TURBOQUANT_WEIGHT_BITS", "3"))
+    prune = float(_os.environ.get("VLLM_GGUF_TURBOQUANT_PRUNE_EXPERTS", "0"))
+
+    result = install_turboquant(
+        kv_k_bits=kv_k,
+        kv_v_bits=kv_v,
+        weight_bits=weight_bits,
+        prune_experts=prune,
+    )
+    if result["kv"]:
+        print(f"[vllm_gguf_plugin] TurboQuant KV compression installed (K={kv_k}, V={kv_v})")
+    if result["weights"]:
+        print(f"[vllm_gguf_plugin] TurboQuant weight compression installed ({weight_bits} bit)")
+
 
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
@@ -201,6 +287,7 @@ def register() -> None:
         register_config_parser("gguf")(GGUFConfigParser)
     _patch_engine_args()
     _patch_speculator_probe()
+    _patch_get_quant_config()
     _patch_hf_image_processor()
     _patch_diffusers_loader()
     _register_qwen35_gguf()
@@ -223,3 +310,7 @@ def register() -> None:
     from .sleep_wake_hybrid import _patch_init_fp8_kv_scales
 
     _patch_init_fp8_kv_scales()
+
+    # TurboQuant+ KV cache and weight compression
+    # Only install if explicitly requested via env vars
+    _install_turboquant()
