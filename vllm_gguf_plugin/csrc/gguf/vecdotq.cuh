@@ -1322,6 +1322,70 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// 2-column fused variant: decodes the q5_K weight block (vl/vh/scales/mins)
+// ONCE and dots it against both activation columns via the same
+// vec_dot_q5_K_q8_1_impl_vmmq scalar function used by the 1-column path (called
+// twice, once per column, with that column's u/d8). Only the redundant weight
+// decode is eliminated; per-column math/op-order is byte-identical to
+// vec_dot_q5_K_q8_1, so results are bitwise-identical. Used by the MTP verify
+// batch=2 path (same pattern as vec_dot_iq4_xs_q8_1_2col, 758367d).
+static __device__ __forceinline__ void vec_dot_q5_K_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq;
+
+    int   vl[2];
+    int   vh[2];
+    int    u0[2*QR5_K];
+    int    u1[2*QR5_K];
+    float d8_0[QR5_K];
+    float d8_1[QR5_K];
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i_0 = bq8_1_c0 + bq8_offset + i;
+        const block_q8_1 * bq8i_1 = bq8_1_c1 + bq8_offset + i;
+        d8_0[i] = __low2float(bq8i_0->ds);
+        d8_1[i] = __low2float(bq8i_1->ds);
+
+        const int * q8_0 = (const int *)bq8i_0->qs + ((iqs/2)%4);
+        const int * q8_1 = (const int *)bq8i_1->qs + ((iqs/2)%4);
+        u0[2*i+0] = q8_0[0];
+        u0[2*i+1] = q8_0[4];
+        u1[2*i+0] = q8_1[0];
+        u1[2*i+1] = q8_1[4];
+    }
+
+    r0 += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u0, sc, m, bq5_K->dm, d8_0);
+    r1 += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u1, sc, m, bq5_K->dm, d8_1);
+#endif
+}
+
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
     __shared__ int   tile_x_ql[mmq_y * (2*WARP_SIZE_GGUF)     + mmq_y];
     __shared__ half2 tile_x_dm[mmq_y * (WARP_SIZE_GGUF/QI5_K) + mmq_y/QI5_K];
@@ -1438,6 +1502,48 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+}
+
+// 2-column fused variant: decodes the q6_K weight block (vl/vh/scales) ONCE
+// and dots it against both activation columns via the same
+// vec_dot_q6_K_q8_1_impl_mmvq scalar function used by the 1-column path
+// (called twice, once per column). Per-column math/op-order is byte-identical
+// to vec_dot_q6_K_q8_1, so results are bitwise-identical. lm_head is q6_K
+// (248320 rows) -- the biggest single tensor read at MTP verify, priority
+// target for this fusion (same pattern as vec_dot_iq4_xs_q8_1_2col, 758367d).
+static __device__ __forceinline__ void vec_dot_q6_K_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_from_uint8(bq6_K->ql, iqs);
+    const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u0[QR6_K];
+    int    u1[QR6_K];
+    float d8_0[QR6_K];
+    float d8_1[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u0[i]  = get_int_from_int8_aligned(bq8_1_c0[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8_0[i] = __low2float(bq8_1_c0[bq8_offset + 2*i].ds);
+        u1[i]  = get_int_from_int8_aligned(bq8_1_c1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8_1[i] = __low2float(bq8_1_c1[bq8_offset + 2*i].ds);
+    }
+
+    const float d = __half2float(bq6_K->d);
+    r0 += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u0, scales, d, d8_0);
+    r1 += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u1, scales, d, d8_1);
+#endif
 }
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q6_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
@@ -1751,7 +1857,28 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
 
 static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4, const uint8_t * values,
         int & val1, int & val2) {
+#if defined(__CUDA_ARCH__) && !defined(USE_ROCM)
+    // Register-only nibble->value lookup via PRMT (ported from ik_llama.cpp).
+    // Avoids 8 scattered byte loads from device memory per 32-bit word.
+    uint32_t v1, v2, v3, v4, mask;
+    const uint32_t * values32 = (const uint32_t *)values;
 
+    mask = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    // Lookups in the lower half of the table (indices 0-7).
+    v1 = __byte_perm(values32[0], values32[1], q4);
+    // Lookups in the upper half of the table (indices 8-15).
+    v2 = __byte_perm(values32[2], values32[3], q4);
+    // Select low/high result based on the MSB of each index nibble.
+    v3 = __byte_perm(v1, v2, mask);
+    // Same for the upper 16 bits of q4.
+    v1 = __byte_perm(values32[0], values32[1], q4 >> 16);
+    v2 = __byte_perm(values32[2], values32[3], q4 >> 16);
+    v4 = __byte_perm(v1, v2, mask >> 16);
+
+    // Even bytes -> low-nibble values, odd bytes -> high-nibble values.
+    val1 = __byte_perm(v3, v4, 0x6420);
+    val2 = __byte_perm(v3, v4, 0x7531);
+#else
     uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
     aux32 = q4 & 0x0f0f0f0f;
     uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
@@ -1761,6 +1888,7 @@ static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4
     v1 = values[q8[0]] | (values[q8[1]] << 8);
     v2 = values[q8[2]] | (values[q8[3]] << 8);
     val2 = v1 | (v2 << 16);
+#endif
 }
 
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
@@ -1798,8 +1926,20 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const int ib32 = iqs;
     const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
     const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
-    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
-    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[ib32].ds);
+
+    // Header (d: half[2B] + scales_h: uint16[2B] + scales_l[4B] = 8B) is laid out
+    // contiguously at the front of block_iq4_xs (verified: sizeof == 136, 8-aligned
+    // per block, so this cast is safe/aligned for all block indices). Load it as a
+    // single 64-bit word instead of 3 scattered loads (d, scales_l[ib32/2], scales_h)
+    // per ib32 call.
+    const uint64_t header = *(const uint64_t * __restrict__)bq4;
+    const half   d_h      = __ushort_as_half((unsigned short)(header & 0xFFFFULL));
+    const uint16_t scales_h = (uint16_t)((header >> 16) & 0xFFFFULL);
+    const uint32_t scales_l_word = (uint32_t)(header >> 32);
+    const uint8_t  scales_l_byte = (uint8_t)((scales_l_word >> (8 * (ib32 / 2))) & 0xFFU);
+
+    const int8_t ls = ((scales_l_byte >> 4*(ib32%2)) & 0xf) | (((scales_h >> 2*ib32) & 3) << 4);
+    const float d = __half2float(d_h) * (ls - 32) * __low2float(bq8_1[ib32].ds);
     int v1, v2;
     int sumi1 = 0, sumi2 = 0;
     for (int j = 0; j < 4; ++j) {
@@ -1808,5 +1948,47 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
         sumi2 = __dp4a(v2, q8[j+4], sumi2);
     }
     return d * (sumi1 + sumi2);
+#endif
+}
+
+// 2-column fused variant: decodes the iq4_xs weights (q4 loads + PRMT nibble
+// lookup + header/scale extraction) ONCE and dots them against two q8_1
+// activation columns. Per-column math is identical to vec_dot_iq4_xs_q8_1
+// (same op order/association), so results are bitwise-identical; only the
+// redundant weight decode is eliminated. Used by the MTP verify batch=2 path.
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_2col(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1_c0,
+    const block_q8_1 * __restrict__ bq8_1_c1, const int & iqs,
+    float & r0, float & r1) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    const int ib32 = iqs;
+    const int32_t  * q8a = (const int *)bq8_1_c0[ib32].qs;
+    const int32_t  * q8b = (const int *)bq8_1_c1[ib32].qs;
+    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
+
+    const uint64_t header = *(const uint64_t * __restrict__)bq4;
+    const half   d_h      = __ushort_as_half((unsigned short)(header & 0xFFFFULL));
+    const uint16_t scales_h = (uint16_t)((header >> 16) & 0xFFFFULL);
+    const uint32_t scales_l_word = (uint32_t)(header >> 32);
+    const uint8_t  scales_l_byte = (uint8_t)((scales_l_word >> (8 * (ib32 / 2))) & 0xFFU);
+
+    const int8_t ls = ((scales_l_byte >> 4*(ib32%2)) & 0xf) | (((scales_h >> 2*ib32) & 3) << 4);
+    const float da = __half2float(d_h) * (ls - 32) * __low2float(bq8_1_c0[ib32].ds);
+    const float db = __half2float(d_h) * (ls - 32) * __low2float(bq8_1_c1[ib32].ds);
+    int v1, v2;
+    int sumi1a = 0, sumi2a = 0, sumi1b = 0, sumi2b = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        get_int_from_table_16(q4[j], values, v1, v2);
+        sumi1a = __dp4a(v1, q8a[j+0], sumi1a);
+        sumi2a = __dp4a(v2, q8a[j+4], sumi2a);
+        sumi1b = __dp4a(v1, q8b[j+0], sumi1b);
+        sumi2b = __dp4a(v2, q8b[j+4], sumi2b);
+    }
+    r0 += da * (sumi1a + sumi2a);
+    r1 += db * (sumi1b + sumi2b);
 #endif
 }
