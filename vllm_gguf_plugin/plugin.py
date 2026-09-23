@@ -127,8 +127,40 @@ def _register_omni_diffusion_quantization() -> None:
     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
 
 
+def _disable_custom_ops() -> None:
+    """Disable vLLM custom ops to reduce memory overhead.
+
+    When VLLM_GGUF_NO_CUSTOM_OPS=1, we monkey-patch the platform's
+    get_default_ir_op_priority to return native-only ops.
+    """
+    import os as _os
+
+    if not _os.environ.get("VLLM_GGUF_NO_CUSTOM_OPS", "").strip():
+        return
+
+    try:
+        from vllm.config import IrOpPriority
+        from vllm.platforms import current_platform
+
+        _orig_get_default = current_platform.get_default_ir_op_priority
+
+        def _patched_get_default(vllm_config):
+            result = _orig_get_default(vllm_config)
+            # Force native-only
+            result.rms_norm = IrOpPriority(native=1.0)
+            result.fused_add_rms_norm = IrOpPriority(native=1.0)
+            return result
+
+        current_platform.get_default_ir_op_priority = _patched_get_default
+    except Exception as e:
+        print(f"[vllm_gguf] _disable_custom_ops failed: {e}")
+
+
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
+    # Disable custom ops if requested (reduces memory overhead)
+    _disable_custom_ops()
+
     register_quantization_config("gguf")(GGUFConfig)
     _register_omni_diffusion_quantization()
 
