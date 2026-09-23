@@ -33,7 +33,9 @@ def _in_bounds_spec(handler) -> tuple:
     """Build src/dst/sizes tensors whose pointers fall within handler's ranges."""
     src_ptrs = np.array([t.data_ptr() for t in handler.src_tensors], dtype=np.uint64)
     dst_ptrs = np.array([t.data_ptr() for t in handler.dst_tensors], dtype=np.uint64)
-    sizes = np.array([t.numel() * t.element_size() for t in handler.src_tensors], dtype=np.uint64)
+    sizes = np.array(
+        [t.numel() * t.element_size() for t in handler.src_tensors], dtype=np.uint64
+    )
     return (
         torch.from_numpy(src_ptrs),
         torch.from_numpy(dst_ptrs),
@@ -47,7 +49,9 @@ def _out_of_bounds_spec(handler) -> tuple:
     src_ptrs = np.array([t.data_ptr() for t in handler.src_tensors], dtype=np.uint64)
     src_ptrs[0] = 0xDEAD0000  # clearly invalid
     dst_ptrs = np.array([t.data_ptr() for t in handler.dst_tensors], dtype=np.uint64)
-    sizes = np.array([t.numel() * t.element_size() for t in handler.src_tensors], dtype=np.uint64)
+    sizes = np.array(
+        [t.numel() * t.element_size() for t in handler.src_tensors], dtype=np.uint64
+    )
     return (
         torch.from_numpy(src_ptrs),
         torch.from_numpy(dst_ptrs),
@@ -182,7 +186,9 @@ def test_strided_view_row_in_bounds_and_scalar_wrong_block_caught(tmp_path):
     src_ptrs = np.array([view.data_ptr() + b * 64 for b in range(4)], dtype=np.uint64)
     dst_ptrs = np.array([dst_ptr + b * 16 for b in range(4)], dtype=np.uint64)
     sizes = np.full(4, 16, dtype=np.uint64)
-    wrapped(torch.from_numpy(src_ptrs), torch.from_numpy(dst_ptrs), torch.from_numpy(sizes))
+    wrapped(
+        torch.from_numpy(src_ptrs), torch.from_numpy(dst_ptrs), torch.from_numpy(sizes)
+    )
     assert calls == [4]
 
     # wrong-block scalar: 4B read at block index 5 (past the 4-block view

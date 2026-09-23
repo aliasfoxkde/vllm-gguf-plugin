@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+
 import gguf
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -83,10 +85,10 @@ def _store_gguf_loaded_weight(
             loaded_weight = loaded_weight.cpu()
         loaded_weight = loaded_weight.contiguous()
         if torch.cuda.is_available():
-            try:
+            # Pinned staging speeds the H2D copy; fall back to pageable
+            # memory when the pin allocator is exhausted.
+            with contextlib.suppress(RuntimeError):
                 loaded_weight = loaded_weight.pin_memory()
-            except RuntimeError:
-                pass
         if shard_id not in param.shard_id_map:
             param.shard_id_map[shard_id] = len(param.data_container)
             param.data_container.append(loaded_weight)
@@ -98,9 +100,7 @@ def _store_gguf_loaded_weight(
         return
 
     loaded_weight = loaded_weight.to(device=param.device)
-    _materialize_parameter_data(
-        param, tuple(loaded_weight.shape), loaded_weight.dtype
-    )
+    _materialize_parameter_data(param, tuple(loaded_weight.shape), loaded_weight.dtype)
     param.data.copy_(loaded_weight)
 
 

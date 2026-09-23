@@ -9,8 +9,8 @@ source shards (zero transient GPU allocations in the merged path).
 """
 
 import torch
-
 import vllm.model_executor.parameter as parameter_module
+
 from vllm_gguf_plugin.quantization.linear import GGUFLinearMethod
 from vllm_gguf_plugin.quantization.params import (
     GGUFWeightParameter,
@@ -34,7 +34,9 @@ class _FakeLayer:
 def test_store_shards_on_cpu(monkeypatch):
     """All tensors in data_container after _store with shard_id are CPU."""
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     param = GGUFWeightParameter(
         data=torch.empty(0, dtype=torch.float32),
         weight_loader=lambda p, w, s=None: None,
@@ -62,7 +64,9 @@ def test_padded_from_cpu_shards(monkeypatch):
     to max width.  Result is on CPU when CUDA is absent; shard_offset_map is
     correct; data_container emptied."""
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     param = GGUFWeightParameter(
         data=torch.empty(0, dtype=torch.float32),
         weight_loader=lambda p, w, s=None: None,
@@ -109,7 +113,9 @@ def test_single_shard_staging(monkeypatch):
     """Single CPU shard: _create_padded_weight_param moves it to param.data
     and clears the container."""
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     param = GGUFWeightParameter(
         data=torch.empty(0, dtype=torch.float32),
         weight_loader=lambda p, w, s=None: None,

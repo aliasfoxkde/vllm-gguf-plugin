@@ -79,7 +79,9 @@ def wrap_swap_blocks(handler, fn):
     # Cache ranges on the handler instance.
     handler._offload_instr_src_ranges = _compute_ranges(handler.src_tensors)
     handler._offload_instr_dst_ranges = _compute_ranges(handler.dst_tensors)
-    handler._offload_instr_tensor_ids = _tensor_ids(handler.src_tensors + handler.dst_tensors)
+    handler._offload_instr_tensor_ids = _tensor_ids(
+        handler.src_tensors + handler.dst_tensors
+    )
 
     # vLLM calls with extra kwargs (is_src_access_order_any=...) — pass through.
     def validated(src, dst, sizes, *args, **kwargs):
@@ -102,9 +104,9 @@ def wrap_swap_blocks(handler, fn):
         def _check(ptrs, sizes, ranges):
             if len(ranges) == 0:
                 return np.zeros(len(ptrs), dtype=bool)
-            lo = ranges[:, 0][None, :]   # (1, n_ranges)
-            hi = ranges[:, 1][None, :]   # (1, n_ranges)
-            p = ptrs[:, None]            # (n_ops, 1)
+            lo = ranges[:, 0][None, :]  # (1, n_ranges)
+            hi = ranges[:, 1][None, :]  # (1, n_ranges)
+            p = ptrs[:, None]  # (n_ops, 1)
             e = (ptrs + sizes)[:, None]  # (n_ops, 1)
             in_range = (lo <= p) & (e <= hi)  # (n_ops, n_ranges)
             return in_range.any(axis=1)  # (n_ops,)
@@ -126,7 +128,9 @@ def wrap_swap_blocks(handler, fn):
         bad_indices = np.where(any_violation)[0]
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "gpu_to_cpu": bool(handler.gpu_to_cpu) if hasattr(handler, "gpu_to_cpu") else None,
+            "gpu_to_cpu": bool(handler.gpu_to_cpu)
+            if hasattr(handler, "gpu_to_cpu")
+            else None,
             "num_ops": int(n_ops),
             "offending_indices": [int(i) for i in bad_indices[:20]],
             "offending_ops": [
@@ -147,7 +151,9 @@ def wrap_swap_blocks(handler, fn):
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-        raise RuntimeError("offload transfer bounds violation (see offload-instrument.jsonl)")
+        raise RuntimeError(
+            "offload transfer bounds violation (see offload-instrument.jsonl)"
+        )
 
     return validated
 
@@ -167,7 +173,9 @@ def install() -> None:
         logger.info("vllm not available — offload instrument not installed")
         return
 
-    if getattr(SingleDirectionOffloadingHandler, "_gguf_offload_instrument_patched", False):
+    if getattr(
+        SingleDirectionOffloadingHandler, "_gguf_offload_instrument_patched", False
+    ):
         return
 
     original_init = SingleDirectionOffloadingHandler.__init__
