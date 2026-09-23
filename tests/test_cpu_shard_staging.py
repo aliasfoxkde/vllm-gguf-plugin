@@ -19,10 +19,10 @@ from vllm_gguf_plugin.quantization.params import (
 
 
 class _FakeLayer:
-    """Minimal layer object with a qweight parameter."""
+    """Minimal layer object with an org-interface weight parameter."""
 
-    def __init__(self, qweight):
-        self.qweight = qweight
+    def __init__(self, weight):
+        self.weight = weight
 
     def register_parameter(self, name, param):
         setattr(self, name, param)
@@ -83,7 +83,7 @@ def test_padded_from_cpu_shards(monkeypatch):
     method = GGUFLinearMethod(quant_config=None)
     method._create_padded_weight_param(layer)
 
-    result = layer.qweight.data
+    result = layer.weight.data
     assert result.shape == (9, 8), f"Expected (9, 8) got {result.shape}"
 
     # Row ranges with correct values (device is GPU if CUDA available, CPU otherwise)
@@ -93,13 +93,13 @@ def test_padded_from_cpu_shards(monkeypatch):
     assert (result[4:6, 6:8] == 0.0).all(), "shard k padding mismatch"
     assert (result[6:9, 0:8] == 3.0).all(), "shard v mismatch"
 
-    offset_map = getattr(layer.qweight, "shard_offset_map", None)
+    offset_map = getattr(layer.weight, "shard_offset_map", None)
     assert offset_map is not None
     assert offset_map["q"] == (0, 4, 8)
     assert offset_map["k"] == (4, 6, 6)
     assert offset_map["v"] == (6, 9, 8)
 
-    assert len(layer.qweight.data_container) == 0, "container not emptied"
+    assert len(layer.weight.data_container) == 0, "container not emptied"
 
 
 # ── Test 3: single-shard case — staging tensor moved to param.data ──────
@@ -127,7 +127,7 @@ def test_single_shard_staging(monkeypatch):
     method = GGUFLinearMethod(quant_config=None)
     method._create_padded_weight_param(layer)
 
-    result = layer.qweight.data
+    result = layer.weight.data
     assert result.shape == (4, 8), f"Expected (4, 8) got {result.shape}"
     assert (result == 1.0).all(), "single shard values mismatch"
-    assert len(layer.qweight.data_container) == 0, "container not emptied"
+    assert len(layer.weight.data_container) == 0, "container not emptied"
